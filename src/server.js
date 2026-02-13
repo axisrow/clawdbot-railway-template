@@ -633,6 +633,7 @@ function buildOnboardArgs(payload) {
 }
 
 function runCmd(cmd, args, opts = {}) {
+  const timeoutMs = opts.timeout ?? 60_000; // Default 60s timeout
   return new Promise((resolve) => {
     const proc = childProcess.spawn(cmd, args, {
       ...opts,
@@ -644,7 +645,17 @@ function runCmd(cmd, args, opts = {}) {
     });
 
     let out = "";
+    let settled = false;
     const MAX_OUTPUT = 10_000; // Limit output to 10KB to prevent heap issues
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      out += `\n[timeout] killed after ${timeoutMs / 1000}s\n`;
+      try { proc.kill("SIGKILL"); } catch {}
+      resolve({ code: 124, output: out });
+    }, timeoutMs);
+
     proc.stdout?.on("data", (d) => {
       const chunk = d.toString("utf8");
       if (out.length < MAX_OUTPUT) {
@@ -659,11 +670,19 @@ function runCmd(cmd, args, opts = {}) {
     });
 
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
     });
 
-    proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
+    proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code: code ?? 0, output: out });
+    });
   });
 }
 
@@ -1057,14 +1076,22 @@ app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
-  // Minimal reset: delete the config file so /setup can rerun.
+  // Reset: stop the gateway (free memory) and delete config so /setup can rerun.
   // Keep credentials/sessions/workspace by default.
   try {
+    // Kill the gateway first — frees memory so the subsequent onboard run
+    // is less likely to OOM on memory-constrained Railway containers.
+    if (gatewayProc) {
+      try { gatewayProc.kill("SIGTERM"); } catch {}
+      await sleep(500);
+      gatewayProc = null;
+    }
+
     const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
     for (const p of candidates) {
       try { fs.rmSync(p, { force: true }); } catch {}
     }
-    res.type("text/plain").send("OK - deleted config file(s). You can rerun setup now.");
+    res.type("text/plain").send("OK - stopped gateway and deleted config file(s). You can rerun setup now.");
   } catch (err) {
     res.status(500).type("text/plain").send(String(err));
   }
