@@ -645,7 +645,6 @@ function buildOnboardArgs(payload) {
 }
 
 function runCmd(cmd, args, opts = {}) {
-  const timeoutMs = opts.timeout ?? 60_000; // Default 60s timeout
   return new Promise((resolve) => {
     const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 120_000;
 
@@ -705,6 +704,12 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   const step = (msg) => { res.write(msg + "\n"); };
 
+  // Keepalive wrapper: writes a dot every 10s to prevent Railway proxy idle-timeout.
+  function runCmdAlive(cmd, args, opts) {
+    const iv = setInterval(() => res.write(".\n"), 10_000);
+    return runCmd(cmd, args, opts).finally(() => clearInterval(iv));
+  }
+
   try {
     if (isConfigured()) {
       await ensureGatewayRunning();
@@ -728,7 +733,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     }
 
     step("[1/5] Running onboard...");
-    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+    const onboard = await runCmdAlive(OPENCLAW_NODE, clawArgs(onboardArgs));
 
   let extra = "";
 
@@ -788,7 +793,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
-    const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+    const channelsHelp = await runCmdAlive(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
     const helpText = channelsHelp.output || "";
 
     const supports = (name) => helpText.includes(name);
@@ -860,18 +865,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
-    step("[4.5/5] Applying doctor fixes...");
-    const doctorFix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
-    extra += `\n[doctor --fix] exit=${doctorFix.code}\n${doctorFix.output || "(no output)"}`;
-
-    // doctor --fix may overwrite openclaw.json; re-apply gateway tokens
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
-    // doctor --fix may disable the telegram plugin; force-enable it
-    if (payload.telegramToken?.trim()) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "plugins.entries.telegram", JSON.stringify({ enabled: true })]));
-    }
-
     step("[5/5] Restarting gateway...");
     // Apply changes immediately.
     await restartGateway();
@@ -879,20 +872,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     // Give the gateway a moment to initialize channels after restart.
     await sleep(2000);
 
-    // Run doctor --fix again now that gateway is running — this should activate channels
-    const doctorFix2 = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
-    extra += `\n[doctor --fix post-restart] exit=${doctorFix2.code}\n${doctorFix2.output || "(no output)"}`;
-
-    // Re-apply tokens again in case doctor overwrote them
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
-    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
-    // doctor --fix may disable the telegram plugin; force-enable it
-    if (payload.telegramToken?.trim()) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "plugins.entries.telegram", JSON.stringify({ enabled: true })]));
-    }
-
     step("[status] Checking channel status...");
-    const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+    const statusResult = await runCmdAlive(OPENCLAW_NODE, clawArgs(["status"]));
     const statusOutput = statusResult.output || "";
     extra += `\n[status] ${statusOutput}`;
 
