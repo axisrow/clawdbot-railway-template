@@ -143,6 +143,7 @@ let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -582,7 +583,6 @@ function buildOnboardArgs(payload) {
     "--non-interactive",
     "--accept-risk",
     "--json",
-    "--no-install-daemon",
     "--skip-health",
     "--workspace",
     WORKSPACE_DIR,
@@ -858,9 +858,50 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
+    step("[4.5/5] Applying doctor fixes...");
+    const doctorFix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+    extra += `\n[doctor --fix] exit=${doctorFix.code}\n${doctorFix.output || "(no output)"}`;
+
+    // doctor --fix may overwrite openclaw.json; re-apply gateway tokens
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    // doctor --fix may disable the telegram plugin; force-enable it
+    if (payload.telegramToken?.trim()) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "plugins.entries.telegram", JSON.stringify({ enabled: true })]));
+    }
+
     step("[5/5] Restarting gateway...");
     // Apply changes immediately.
     await restartGateway();
+
+    // Give the gateway a moment to initialize channels after restart.
+    await sleep(2000);
+
+    // Run doctor --fix again now that gateway is running — this should activate channels
+    const doctorFix2 = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+    extra += `\n[doctor --fix post-restart] exit=${doctorFix2.code}\n${doctorFix2.output || "(no output)"}`;
+
+    // Re-apply tokens again in case doctor overwrote them
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+    // doctor --fix may disable the telegram plugin; force-enable it
+    if (payload.telegramToken?.trim()) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "plugins.entries.telegram", JSON.stringify({ enabled: true })]));
+    }
+
+    step("[status] Checking channel status...");
+    const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+    const statusOutput = statusResult.output || "";
+    extra += `\n[status] ${statusOutput}`;
+
+    if (payload.telegramToken?.trim()) {
+      const telegramOk = /telegram.*(?:running|started|polling|connected)/i.test(statusOutput);
+      if (telegramOk) {
+        extra += "\n[telegram] \u2713 Telegram bot polling started";
+      } else {
+        extra += "\n[telegram] \u26a0 Telegram bot status unclear \u2014 check Debug Console \u2192 openclaw status";
+      }
+    }
   }
 
   const nextSteps = ok
@@ -932,6 +973,7 @@ function extractDeviceRequestIds(text) {
 
   for (const m of s.matchAll(/requestId\s*(?:=|:)\s*([A-Za-z0-9_-]{6,})/g)) out.add(m[1]);
   for (const m of s.matchAll(/"requestId"\s*:\s*"([A-Za-z0-9_-]{6,})"/g)) out.add(m[1]);
+  for (const m of s.matchAll(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi)) out.add(m[1]);
 
   return Array.from(out);
 }
