@@ -866,8 +866,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   }));
   } catch (err) {
     console.error("[/setup/api/run] error:", err);
+    const cause = err.cause ? `\nCaused by: ${err.cause.stack || String(err.cause)}` : "";
     step("---RESULT---");
-    res.end(JSON.stringify({ ok: false, output: `Internal error: ${String(err)}` }));
+    res.end(JSON.stringify({ ok: false, output: `Internal error: ${err.stack || String(err)}${cause}` }));
   }
 });
 

@@ -231,7 +231,11 @@
         return refreshStatus();
       });
     }).catch(function (e) {
-      logEl.textContent += '\nError: ' + String(e) + '\n';
+      var details = e.stack || e.message || String(e);
+      var hint = /network|fetch|ECONNREFUSED/i.test(details)
+        ? '\nHint: check your connection or make sure the server is running.'
+        : '';
+      logEl.textContent += '\nError: ' + details + hint + '\n';
     });
   };
 
