@@ -171,6 +171,14 @@ async function waitForGatewayReady(opts = {}) {
   return false;
 }
 
+async function probeGateway() {
+  const res = await fetch(`${GATEWAY_TARGET}/`, {
+    method: "GET",
+    signal: AbortSignal.timeout(3000),
+  });
+  return res.ok || res.status < 500;
+}
+
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
@@ -364,7 +372,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <div id="status">Loading...</div>
     <div id="statusDetails" class="muted" style="margin-top:0.5rem"></div>
     <div style="margin-top: 0.75rem">
-      <a href="/openclaw" target="_blank">Open OpenClaw UI</a>
+      <a href="/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}" target="_blank">Open OpenClaw UI</a>
       &nbsp;|&nbsp;
       <a href="/setup/export" target="_blank">Download backup (.tar.gz)</a>
     </div>
@@ -784,7 +792,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     const supports = (name) => helpText.includes(name);
 
     if (payload.telegramToken?.trim()) {
-      step("[3/5] Adding Telegram channel...");
+      step("[3/5] Configuring Telegram bot...");
       if (!supports("telegram")) {
         extra += "\n[telegram] skipped (this openclaw build does not list telegram in `channels add --help`)\n";
       } else {
@@ -808,7 +816,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     }
 
     if (payload.discordToken?.trim()) {
-      step("[4/5] Adding Discord channel...");
+      step("[4/5] Configuring Discord bot...");
       if (!supports("discord")) {
         extra += "\n[discord] skipped (this openclaw build does not list discord in `channels add --help`)\n";
       } else {
