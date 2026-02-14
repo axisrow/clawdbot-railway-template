@@ -704,11 +704,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   const step = (msg) => { res.write(msg + "\n"); };
 
-  // Keepalive wrapper: writes a dot every 10s to prevent Railway proxy idle-timeout.
-  function runCmdAlive(cmd, args, opts) {
-    const iv = setInterval(() => res.write(".\n"), 10_000);
-    return runCmd(cmd, args, opts).finally(() => clearInterval(iv));
-  }
+  // Global keepalive: prevent Railway proxy idle-timeout across ALL steps.
+  const keepalive = setInterval(() => {
+    try { res.write(".\n"); } catch {}
+  }, 10_000);
 
   try {
     if (isConfigured()) {
@@ -733,7 +732,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     }
 
     step("[1/5] Running onboard...");
-    const onboard = await runCmdAlive(OPENCLAW_NODE, clawArgs(onboardArgs));
+    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
 
   let extra = "";
 
@@ -793,7 +792,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
-    const channelsHelp = await runCmdAlive(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+    const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
     const helpText = channelsHelp.output || "";
 
     const supports = (name) => helpText.includes(name);
@@ -873,7 +872,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await sleep(2000);
 
     step("[status] Checking channel status...");
-    const statusResult = await runCmdAlive(OPENCLAW_NODE, clawArgs(["status"]));
+    const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
     const statusOutput = statusResult.output || "";
     extra += `\n[status] ${statusOutput}`;
 
@@ -901,6 +900,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     const cause = err.cause ? `\nCaused by: ${err.cause.stack || String(err.cause)}` : "";
     step("---RESULT---");
     res.end(JSON.stringify({ ok: false, output: `Internal error: ${err.stack || String(err)}${cause}` }));
+  } finally {
+    clearInterval(keepalive);
   }
 });
 
