@@ -422,5 +422,6 @@
       .catch(function (e) { logEl.textContent += 'Error (/setup/api/reset): ' + String(e) + '\n'; });
   };
 
-  refreshStatus();
+  renderAuthFallback();   // auth groups load instantly (no CLI)
+  refreshStatus();        // heavy CLI calls run in parallel
 })();

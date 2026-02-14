@@ -561,8 +561,10 @@ const AUTH_GROUPS = [
 ];
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
-  const version = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
-  const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+  const [version, channelsHelp] = await Promise.all([
+    runCmd(OPENCLAW_NODE, clawArgs(["--version"])),
+    runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"])),
+  ]);
 
   res.json({
     configured: isConfigured(),
