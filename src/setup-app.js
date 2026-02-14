@@ -185,12 +185,51 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload)
     }).then(function (res) {
-      return res.text();
-    }).then(function (text) {
-      var j;
-      try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
-      logEl.textContent += (j.output || JSON.stringify(j, null, 2));
-      return refreshStatus();
+      // Stream progress via ReadableStream when available.
+      if (res.body && typeof res.body.getReader === 'function') {
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buf = '';
+
+        function pump() {
+          return reader.read().then(function (result) {
+            if (result.done) {
+              // Parse final JSON after ---RESULT--- marker.
+              var idx = buf.indexOf('---RESULT---\n');
+              if (idx !== -1) {
+                var jsonStr = buf.slice(idx + '---RESULT---\n'.length);
+                var j;
+                try { j = JSON.parse(jsonStr); } catch (_e) { j = { ok: false, output: jsonStr }; }
+                logEl.textContent += (j.output || JSON.stringify(j, null, 2));
+              }
+              return refreshStatus();
+            }
+            var chunk = decoder.decode(result.value, { stream: true });
+            buf += chunk;
+            // Show progress lines (everything before ---RESULT---).
+            var parts = chunk.split('\n');
+            for (var i = 0; i < parts.length; i++) {
+              var line = parts[i];
+              if (line && line !== '---RESULT---' && line.indexOf('{') !== 0) {
+                logEl.textContent += line + '\n';
+              }
+            }
+            return pump();
+          });
+        }
+
+        return pump();
+      }
+
+      // Fallback for browsers without ReadableStream.
+      return res.text().then(function (text) {
+        var idx = text.indexOf('---RESULT---\n');
+        var jsonStr = idx !== -1 ? text.slice(idx + '---RESULT---\n'.length) : text;
+        var j;
+        try { j = JSON.parse(jsonStr); } catch (_e) { j = { ok: false, output: text }; }
+        logEl.textContent += (j.output || JSON.stringify(j, null, 2));
+        return refreshStatus();
+      });
     }).catch(function (e) {
       logEl.textContent += '\nError: ' + String(e) + '\n';
     });

@@ -488,7 +488,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <button id="pairingApprove" style="background:#1f2937; margin-left:0.5rem">Approve pairing</button>
     <button id="reset" style="background:#444; margin-left:0.5rem">Reset setup</button>
     <pre id="log" style="white-space:pre-wrap"></pre>
-    <p class="muted">Reset deletes the OpenClaw config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
+    <p class="muted">"Run setup" runs the onboarding wizard. If already configured, click "Reset setup" first to start over.</p>
 
     <details style="margin-top: 0.75rem">
       <summary><strong>Pairing helper</strong> (for “disconnected (1008): pairing required”)</summary>
@@ -687,10 +687,20 @@ function runCmd(cmd, args, opts = {}) {
 }
 
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+  // Stream progress as chunked text so the UI updates in real time.
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const step = (msg) => { res.write(msg + "\n"); };
+
   try {
     if (isConfigured()) {
       await ensureGatewayRunning();
-      return res.json({ ok: true, output: "Already configured.\nUse Reset setup if you want to rerun onboarding.\n" });
+      step("---RESULT---");
+      res.end(JSON.stringify({ ok: true, output: "\u2713 Setup is already complete \u2014 your bot should be running.\n\nTo reconfigure, click \"Reset setup\" below, then run setup again." }));
+      return;
     }
 
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -702,9 +712,12 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     try {
       onboardArgs = buildOnboardArgs(payload);
     } catch (err) {
-      return res.status(400).json({ ok: false, output: `Setup input error: ${String(err)}` });
+      step("---RESULT---");
+      res.end(JSON.stringify({ ok: false, output: `Setup input error: ${String(err)}` }));
+      return;
     }
 
+    step("[1/5] Running onboard...");
     const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
 
   let extra = "";
@@ -713,6 +726,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
   // Optional setup (only after successful onboarding).
   if (ok) {
+    step("[2/5] Configuring gateway...");
     // Ensure gateway token is written into config so the browser UI can authenticate reliably.
     // (We also enforce loopback bind since the wrapper proxies externally.)
     // IMPORTANT: Set both gateway.auth.token (server-side) and gateway.remote.token (client-side)
@@ -770,6 +784,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     const supports = (name) => helpText.includes(name);
 
     if (payload.telegramToken?.trim()) {
+      step("[3/5] Adding Telegram channel...");
       if (!supports("telegram")) {
         extra += "\n[telegram] skipped (this openclaw build does not list telegram in `channels add --help`)\n";
       } else {
@@ -793,6 +808,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     }
 
     if (payload.discordToken?.trim()) {
+      step("[4/5] Adding Discord channel...");
       if (!supports("discord")) {
         extra += "\n[discord] skipped (this openclaw build does not list discord in `channels add --help`)\n";
       } else {
@@ -834,17 +850,24 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
+    step("[5/5] Restarting gateway...");
     // Apply changes immediately.
     await restartGateway();
   }
 
-  return res.status(ok ? 200 : 500).json({
+  const nextSteps = ok
+    ? "\n\u2713 Setup complete!\n\nNext steps:\n\u2192 Open OpenClaw UI to manage your bot\n\u2192 Your bot should now be responding to messages\n\u2192 If it\u2019s not responding, check /healthz or Debug Console below"
+    : "";
+
+  step("---RESULT---");
+  res.end(JSON.stringify({
     ok,
-    output: `${onboard.output}${extra}`,
-  });
+    output: `${onboard.output}${extra}${nextSteps}`,
+  }));
   } catch (err) {
     console.error("[/setup/api/run] error:", err);
-    return res.status(500).json({ ok: false, output: `Internal error: ${String(err)}` });
+    step("---RESULT---");
+    res.end(JSON.stringify({ ok: false, output: `Internal error: ${String(err)}` }));
   }
 });
 
