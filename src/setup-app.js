@@ -97,10 +97,15 @@
     return fetch(url, opts).then(function (res) {
       if (!res.ok) {
         return res.text().then(function (t) {
-          throw new Error('HTTP ' + res.status + ': ' + (t || res.statusText));
+          throw new Error('HTTP ' + res.status + ' ' + url + ': ' + (t || res.statusText));
         });
       }
       return res.json();
+    }).catch(function (e) {
+      if (e.message && e.message.indexOf(url) === -1) {
+        e.message = url + ' – ' + e.message;
+      }
+      throw e;
     });
   }
 
@@ -235,7 +240,7 @@
       var hint = /network|fetch|ECONNREFUSED/i.test(details)
         ? '\nHint: check your connection or make sure the server is running.'
         : '';
-      logEl.textContent += '\nError: ' + details + hint + '\n';
+      logEl.textContent += '\nError fetching /setup/api/run: ' + details + hint + '\n';
     });
   };
 
@@ -348,7 +353,7 @@
         body: JSON.stringify({ channel: channel, code: code.trim() })
       }).then(function (r) { return r.text(); })
         .then(function (t) { logEl.textContent += t + '\n'; })
-        .catch(function (e) { logEl.textContent += 'Error: ' + String(e) + '\n'; });
+        .catch(function (e) { logEl.textContent += 'Error (/setup/api/pairing/approve): ' + String(e) + '\n'; });
     };
   }
 
@@ -414,7 +419,7 @@
     fetch('/setup/api/reset', { method: 'POST', credentials: 'same-origin' })
       .then(function (res) { return res.text(); })
       .then(function (t) { logEl.textContent += t + '\n'; return refreshStatus(); })
-      .catch(function (e) { logEl.textContent += 'Error: ' + String(e) + '\n'; });
+      .catch(function (e) { logEl.textContent += 'Error (/setup/api/reset): ' + String(e) + '\n'; });
   };
 
   refreshStatus();
