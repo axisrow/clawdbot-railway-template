@@ -864,25 +864,69 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
     }
 
+    // Best-effort: explicitly enable channel plugins.
+    // Some OpenClaw builds require this even when channel config is present.
+    if (payload.telegramToken?.trim()) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "telegram"]));
+    }
+    if (payload.discordToken?.trim()) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "discord"]));
+    }
+    if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "slack"]));
+    }
+
     step("[5/5] Restarting gateway...");
     // Apply changes immediately.
     await restartGateway();
 
-    // Give the gateway a moment to initialize channels after restart.
+    // Give the gateway a moment to initialize after restart.
     await sleep(2000);
 
-    step("[status] Checking channel status...");
-    const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
-    const statusOutput = statusResult.output || "";
+    // Auto-approve any pending device requests so channels can connect.
+    const devList = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+    const pendingIds = extractDeviceRequestIds(devList.output);
+    for (const id of pendingIds) {
+      await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", id]));
+      extra += `\n[devices] approved ${id}`;
+    }
+
+    // Check channel status with retries — channels may need time to initialize.
+    step("[status] Waiting for channels to initialize...");
+    let statusOutput = "";
+    const hasChannels = payload.telegramToken?.trim() || payload.discordToken?.trim() ||
+                        payload.slackBotToken?.trim() || payload.slackAppToken?.trim();
+
+    if (hasChannels) {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+        statusOutput = statusResult.output || "";
+
+        const channelUp = /(?:telegram|discord|slack).*(?:running|started|polling|connected)/i.test(statusOutput);
+        if (channelUp) break;
+
+        if (attempt < 5) {
+          step(`[status] Channels not ready yet, retrying (${attempt}/5)...`);
+          await sleep(3000);
+        }
+      }
+    } else {
+      const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
+      statusOutput = statusResult.output || "";
+    }
     extra += `\n[status] ${statusOutput}`;
 
     if (payload.telegramToken?.trim()) {
       const telegramOk = /telegram.*(?:running|started|polling|connected)/i.test(statusOutput);
-      if (telegramOk) {
-        extra += "\n[telegram] \u2713 Telegram bot polling started";
-      } else {
-        extra += "\n[telegram] \u26a0 Telegram bot status unclear \u2014 check Debug Console \u2192 openclaw status";
-      }
+      extra += telegramOk
+        ? "\n[telegram] \u2713 Telegram bot polling started"
+        : "\n[telegram] \u26a0 Telegram status unclear \u2014 check Debug Console \u2192 openclaw status";
+    }
+    if (payload.discordToken?.trim()) {
+      const discordOk = /discord.*(?:running|started|connected)/i.test(statusOutput);
+      extra += discordOk
+        ? "\n[discord] \u2713 Discord bot connected"
+        : "\n[discord] \u26a0 Discord status unclear \u2014 check Debug Console \u2192 openclaw status";
     }
   }
 
