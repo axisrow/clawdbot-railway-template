@@ -311,6 +311,29 @@ app.use(express.json({ limit: "1mb" }));
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
 
+async function probeGateway() {
+  // Don't assume HTTP — the gateway primarily speaks WebSocket.
+  // A simple TCP connect check is enough for "is it up".
+  const net = await import("node:net");
+
+  return await new Promise((resolve) => {
+    const sock = net.createConnection({
+      host: INTERNAL_GATEWAY_HOST,
+      port: INTERNAL_GATEWAY_PORT,
+      timeout: 750,
+    });
+
+    const done = (ok) => {
+      try { sock.destroy(); } catch {}
+      resolve(ok);
+    };
+
+    sock.on("connect", () => done(true));
+    sock.on("timeout", () => done(false));
+    sock.on("error", () => done(false));
+  });
+}
+
 // Public health endpoint (no auth) so Railway can probe without /setup.
 // Keep this free of secrets.
 app.get("/healthz", async (_req, res) => {
@@ -428,10 +451,14 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <h2>1) Model/auth provider</h2>
     <p class="muted">Matches the groups shown in the terminal onboarding.</p>
     <label>Provider group</label>
-    <select id="authGroup"></select>
+    <select id="authGroup">
+      <option>Loading providers…</option>
+    </select>
 
     <label>Auth method</label>
-    <select id="authChoice"></select>
+    <select id="authChoice">
+      <option>Loading methods…</option>
+    </select>
 
     <label>Key / Token (if required)</label>
     <input id="authSecret" type="password" placeholder="Paste API key / token if applicable" />
@@ -673,9 +700,10 @@ function runCmd(cmd, args, opts = {}) {
       }
     });
 
+    let killTimer;
     const timer = setTimeout(() => {
       try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => {
+      killTimer = setTimeout(() => {
         try { proc.kill("SIGKILL"); } catch {}
       }, 2_000);
       out += `\n[timeout] Command exceeded ${timeoutMs}ms and was terminated.\n`;
@@ -684,12 +712,14 @@ function runCmd(cmd, args, opts = {}) {
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
     });
 
     proc.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({ code: code ?? 0, output: out });
     });
   });
@@ -710,6 +740,11 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   }, 10_000);
 
   try {
+    const safeWrite = (msg) => {
+      try {
+        if (!res.writableEnded) res.write(String(msg) + "\n");
+      } catch {}
+    };
     if (isConfigured()) {
       await ensureGatewayRunning();
       step("---RESULT---");
@@ -816,8 +851,13 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)]),
         );
         const get = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
+
+        // Best-effort: enable the telegram plugin explicitly (some builds require this even when configured).
+        const plug = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "telegram"]));
+
         extra += `\n[telegram config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}`;
         extra += `\n[telegram verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`;
+        extra += `\n[telegram plugin enable] exit=${plug.code} (output ${plug.output.length} chars)\n${plug.output || "(no output)"}`;
       }
     }
 
@@ -880,54 +920,13 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     // Apply changes immediately.
     await restartGateway();
 
-    // Give the gateway a moment to initialize after restart.
-    await sleep(2000);
+    // Ensure OpenClaw applies any "configured but not enabled" channel/plugin changes.
+    // This makes Telegram/Discord pairing issues much less "silent".
+    const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+    extra += `\n[doctor --fix] exit=${fix.code} (output ${fix.output.length} chars)\n${fix.output || "(no output)"}`;
 
-    // Auto-approve any pending device requests so channels can connect.
-    const devList = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
-    const pendingIds = extractDeviceRequestIds(devList.output);
-    for (const id of pendingIds) {
-      await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", id]));
-      extra += `\n[devices] approved ${id}`;
-    }
-
-    // Check channel status with retries — channels may need time to initialize.
-    step("[status] Waiting for channels to initialize...");
-    let statusOutput = "";
-    const hasChannels = payload.telegramToken?.trim() || payload.discordToken?.trim() ||
-                        payload.slackBotToken?.trim() || payload.slackAppToken?.trim();
-
-    if (hasChannels) {
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
-        statusOutput = statusResult.output || "";
-
-        const channelUp = /(?:telegram|discord|slack).*(?:running|started|polling|connected)/i.test(statusOutput);
-        if (channelUp) break;
-
-        if (attempt < 5) {
-          step(`[status] Channels not ready yet, retrying (${attempt}/5)...`);
-          await sleep(3000);
-        }
-      }
-    } else {
-      const statusResult = await runCmd(OPENCLAW_NODE, clawArgs(["status"]));
-      statusOutput = statusResult.output || "";
-    }
-    extra += `\n[status] ${statusOutput}`;
-
-    if (payload.telegramToken?.trim()) {
-      const telegramOk = /telegram.*(?:running|started|polling|connected)/i.test(statusOutput);
-      extra += telegramOk
-        ? "\n[telegram] \u2713 Telegram bot polling started"
-        : "\n[telegram] \u26a0 Telegram status unclear \u2014 check Debug Console \u2192 openclaw status";
-    }
-    if (payload.discordToken?.trim()) {
-      const discordOk = /discord.*(?:running|started|connected)/i.test(statusOutput);
-      extra += discordOk
-        ? "\n[discord] \u2713 Discord bot connected"
-        : "\n[discord] \u26a0 Discord status unclear \u2014 check Debug Console \u2192 openclaw status";
-    }
+    // Doctor may require a restart depending on changes.
+    await restartGateway();
   }
 
   const nextSteps = ok
@@ -953,6 +952,13 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
 
+  // Channel config checks (redact secrets before returning to client)
+  const tg = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
+  const dc = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.discord"]));
+
+  const tgOut = redactSecrets(tg.output || "");
+  const dcOut = redactSecrets(dc.output || "");
+
   res.json({
     wrapper: {
       node: process.version,
@@ -966,6 +972,7 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       internalGatewayHost: INTERNAL_GATEWAY_HOST,
       internalGatewayPort: INTERNAL_GATEWAY_PORT,
       gatewayTarget: GATEWAY_TARGET,
+      gatewayRunning: Boolean(gatewayProc),
       gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
       lastGatewayError,
@@ -979,6 +986,20 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       node: OPENCLAW_NODE,
       version: v.output.trim(),
       channelsAddHelpIncludesTelegram: help.output.includes("telegram"),
+      channels: {
+        telegram: {
+          exit: tg.code,
+          configuredEnabled: /"enabled"\s*:\s*true/.test(tg.output || "") || /enabled\s*[:=]\s*true/.test(tg.output || ""),
+          botTokenPresent: /(\d{5,}:[A-Za-z0-9_-]{10,})/.test(tg.output || ""),
+          output: tgOut,
+        },
+        discord: {
+          exit: dc.code,
+          configuredEnabled: /"enabled"\s*:\s*true/.test(dc.output || "") || /enabled\s*[:=]\s*true/.test(dc.output || ""),
+          tokenPresent: /"token"\s*:\s*"?\S+"?/.test(dc.output || "") || /token\s*[:=]\s*\S+/.test(dc.output || ""),
+          output: dcOut,
+        },
+      },
     },
   });
 });
@@ -992,6 +1013,8 @@ function redactSecrets(text) {
     .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
     .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
+    // Telegram bot tokens look like: 123456:ABCDEF...
+    .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
 }
 
@@ -1356,8 +1379,16 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
-proxy.on("error", (err, _req, _res) => {
+proxy.on("error", (err, _req, res) => {
   console.error("[proxy]", err);
+  try {
+    if (res && typeof res.writeHead === "function" && !res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Gateway unavailable\n");
+    }
+  } catch {
+    // ignore
+  }
 });
 
 app.use(async (req, res) => {
@@ -1389,6 +1420,15 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
+
+  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
+  try {
+    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
+  } catch {}
+  try {
+    fs.chmodSync(STATE_DIR, 0o700);
+  } catch {}
+
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
   if (!SETUP_PASSWORD) {
@@ -1429,5 +1469,13 @@ process.on("SIGTERM", () => {
   } catch {
     // ignore
   }
-  process.exit(0);
+
+  // Stop accepting new connections; allow in-flight requests to complete briefly.
+  try {
+    server.close(() => process.exit(0));
+  } catch {
+    process.exit(0);
+  }
+
+  setTimeout(() => process.exit(0), 5_000).unref?.();
 });

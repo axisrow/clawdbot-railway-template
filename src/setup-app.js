@@ -124,14 +124,6 @@
         statusDetailsEl.textContent = parts.join('\n');
       }
 
-      // Use fallback auth groups if API returns empty/missing authGroups
-      if (j.authGroups && j.authGroups.length > 0) {
-        renderAuth(j.authGroups);
-      } else {
-        console.warn('[setup] authGroups missing or empty, fetching fallback');
-        renderAuthFallback();
-      }
-
       // If channels are unsupported, surface it for debugging.
       if (j.channelsAddHelp && j.channelsAddHelp.indexOf('telegram') === -1) {
         logEl.textContent += '\nNote: this openclaw build does not list telegram in `channels add --help`. Telegram auto-add will be skipped.\n';
@@ -145,14 +137,11 @@
     }).catch(function (e) {
       setStatus('Error: ' + String(e));
       if (statusDetailsEl) statusDetailsEl.textContent = '';
-      // Render default auth groups even on error so setup can proceed
-      renderAuthFallback();
     });
   }
 
-  // Fallback auth groups in case the status API fails.
-  // Keep the source of truth on the server (avoids drift).
-  function renderAuthFallback() {
+  // Fast auth group load (no subprocesses). Keeps selects from appearing empty.
+  function loadAuthGroupsFast() {
     return httpJson('/setup/api/auth-groups').then(function (j) {
       if (j && j.authGroups && j.authGroups.length > 0) {
         renderAuth(j.authGroups);
@@ -160,7 +149,7 @@
       }
       throw new Error('Missing authGroups from /setup/api/auth-groups');
     }).catch(function (e) {
-      console.warn('[setup] authGroups fallback failed:', e);
+      console.warn('[setup] authGroups load failed:', e);
       renderAuth([]);
     });
   }
@@ -422,6 +411,9 @@
       .catch(function (e) { logEl.textContent += 'Error (/setup/api/reset): ' + String(e) + '\n'; });
   };
 
-  renderAuthFallback();   // auth groups load instantly (no CLI)
-  refreshStatus();        // heavy CLI calls run in parallel
+  // Populate provider/auth selects ASAP (fast endpoint, no subprocesses)
+  loadAuthGroupsFast();
+
+  // Load the rest of status (version/help) in parallel
+  refreshStatus();
 })();
