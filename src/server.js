@@ -172,14 +172,6 @@ async function waitForGatewayReady(opts = {}) {
   return false;
 }
 
-async function probeGateway() {
-  const res = await fetch(`${GATEWAY_TARGET}/`, {
-    method: "GET",
-    signal: AbortSignal.timeout(3000),
-  });
-  return res.ok || res.status < 500;
-}
-
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
