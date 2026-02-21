@@ -72,8 +72,33 @@ process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
-const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
-const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
+const INTERNAL_GATEWAY_HOST_RAW = process.env.INTERNAL_GATEWAY_HOST?.trim() || "localhost";
+const GATEWAY_START_TIMEOUT_MS = Number.parseInt(process.env.GATEWAY_START_TIMEOUT_MS ?? "45000", 10);
+
+function resolveGatewayHostCandidates(host) {
+  const explicit = String(host || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const primary = explicit.length ? explicit[0] : "localhost";
+  const defaults = ["localhost", "127.0.0.1", "::1"];
+  return Array.from(new Set([primary, ...explicit.slice(1), ...defaults]));
+}
+
+const INTERNAL_GATEWAY_HOST_CANDIDATES = resolveGatewayHostCandidates(INTERNAL_GATEWAY_HOST_RAW);
+let activeGatewayHost = INTERNAL_GATEWAY_HOST_CANDIDATES[0];
+
+function hostForUrl(host) {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function gatewayTargetForHost(host) {
+  return `http://${hostForUrl(host)}:${INTERNAL_GATEWAY_PORT}`;
+}
+
+function gatewayTarget() {
+  return gatewayTargetForHost(activeGatewayHost);
+}
 
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
@@ -149,23 +174,12 @@ function sleep(ms) {
 }
 
 async function waitForGatewayReady(opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const timeoutMs = opts.timeoutMs ?? GATEWAY_START_TIMEOUT_MS;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      // Try the default Control UI base path, then fall back to root.
-      const paths = ["/openclaw", "/"];
-      for (const p of paths) {
-        try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
-          // Any HTTP response means the port is open.
-          if (res) return true;
-        } catch {
-          // try next
-        }
-      }
-    } catch {
-      // not ready
+    const probe = await probeGateway();
+    if (probe.ok) {
+      return true;
     }
     await sleep(250);
   }
@@ -233,19 +247,40 @@ async function runDoctorBestEffort() {
 
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
+  if (gatewayStarting) {
+    await gatewayStarting;
+    return { ok: true };
+  }
+
+  if (gatewayProc) {
+    const probe = await probeGateway();
+    if (probe.ok) return { ok: true };
+
+    const staleMsg = `[gateway] process is running but ${INTERNAL_GATEWAY_PORT} is unreachable on ${INTERNAL_GATEWAY_HOST_CANDIDATES.join(", ")}`;
+    lastGatewayError = staleMsg;
+    console.warn(staleMsg);
+    try { gatewayProc.kill("SIGTERM"); } catch {}
+    await sleep(750);
+    gatewayProc = null;
+  }
+
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       try {
         lastGatewayError = null;
         await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        const ready = await waitForGatewayReady({ timeoutMs: GATEWAY_START_TIMEOUT_MS });
         if (!ready) {
-          throw new Error("Gateway did not become ready in time");
+          throw new Error(`Gateway did not become ready in time (${GATEWAY_START_TIMEOUT_MS}ms)`);
         }
       } catch (err) {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
+        try {
+          if (gatewayProc) gatewayProc.kill("SIGTERM");
+        } catch {}
+        await sleep(750);
+        gatewayProc = null;
         // Collect extra diagnostics to help users file issues.
         await runDoctorBestEffort();
         throw err;
@@ -307,32 +342,47 @@ async function probeGateway() {
   // Don't assume HTTP — the gateway primarily speaks WebSocket.
   // A simple TCP connect check is enough for "is it up".
   const net = await import("node:net");
+  const hosts = [activeGatewayHost, ...INTERNAL_GATEWAY_HOST_CANDIDATES.filter((h) => h !== activeGatewayHost)];
 
-  return await new Promise((resolve) => {
-    const sock = net.createConnection({
-      host: INTERNAL_GATEWAY_HOST,
-      port: INTERNAL_GATEWAY_PORT,
-      timeout: 750,
+  const checkHost = (host) =>
+    new Promise((resolve) => {
+      const sock = net.createConnection({
+        host,
+        port: INTERNAL_GATEWAY_PORT,
+        timeout: 750,
+      });
+
+      const done = (ok) => {
+        try { sock.destroy(); } catch {}
+        resolve(ok);
+      };
+
+      sock.on("connect", () => done(true));
+      sock.on("timeout", () => done(false));
+      sock.on("error", () => done(false));
     });
 
-    const done = (ok) => {
-      try { sock.destroy(); } catch {}
-      resolve(ok);
-    };
+  for (const host of hosts) {
+    const ok = await checkHost(host);
+    if (ok) {
+      activeGatewayHost = host;
+      return { ok: true, host, target: gatewayTarget() };
+    }
+  }
 
-    sock.on("connect", () => done(true));
-    sock.on("timeout", () => done(false));
-    sock.on("error", () => done(false));
-  });
+  return { ok: false, host: activeGatewayHost, target: gatewayTarget() };
 }
 
 // Public health endpoint (no auth) so Railway can probe without /setup.
 // Keep this free of secrets.
 app.get("/healthz", async (_req, res) => {
   let gatewayReachable = false;
+  let gatewayTargetResolved = gatewayTarget();
   if (isConfigured()) {
     try {
-      gatewayReachable = await probeGateway();
+      const probe = await probeGateway();
+      gatewayReachable = probe.ok;
+      gatewayTargetResolved = probe.target;
     } catch {
       gatewayReachable = false;
     }
@@ -346,7 +396,9 @@ app.get("/healthz", async (_req, res) => {
       workspaceDir: WORKSPACE_DIR,
     },
     gateway: {
-      target: GATEWAY_TARGET,
+      target: gatewayTargetResolved,
+      hostCandidates: INTERNAL_GATEWAY_HOST_CANDIDATES,
+      activeHost: activeGatewayHost,
       reachable: gatewayReachable,
       lastError: lastGatewayError,
       lastExit: lastGatewayExit,
@@ -587,7 +639,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
 
   res.json({
     configured: isConfigured(),
-    gatewayTarget: GATEWAY_TARGET,
+    gatewayTarget: gatewayTarget(),
     openclawVersion: version.output.trim(),
     channelsAddHelp: channelsHelp.output,
     authGroups: AUTH_GROUPS,
@@ -961,9 +1013,11 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       configured: isConfigured(),
       configPathResolved: configPath(),
       configPathCandidates: typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : null,
-      internalGatewayHost: INTERNAL_GATEWAY_HOST,
+      internalGatewayHost: INTERNAL_GATEWAY_HOST_RAW,
+      internalGatewayHostCandidates: INTERNAL_GATEWAY_HOST_CANDIDATES,
+      internalGatewayHostActive: activeGatewayHost,
       internalGatewayPort: INTERNAL_GATEWAY_PORT,
-      gatewayTarget: GATEWAY_TARGET,
+      gatewayTarget: gatewayTarget(),
       gatewayRunning: Boolean(gatewayProc),
       gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
@@ -1366,7 +1420,6 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
 
 // Proxy everything else to the gateway.
 const proxy = httpProxy.createProxyServer({
-  target: GATEWAY_TARGET,
   ws: true,
   xfwd: true,
 });
@@ -1405,7 +1458,7 @@ app.use(async (req, res) => {
     }
   }
 
-  return proxy.web(req, res, { target: GATEWAY_TARGET });
+  return proxy.web(req, res, { target: gatewayTarget() });
 });
 
 const server = app.listen(PORT, "0.0.0.0", async () => {
@@ -1422,7 +1475,8 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   } catch {}
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
-  console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+  console.log(`[wrapper] gateway host candidates: ${INTERNAL_GATEWAY_HOST_CANDIDATES.join(", ")}`);
+  console.log(`[wrapper] gateway target: ${gatewayTarget()}`);
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
@@ -1451,7 +1505,7 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
+  proxy.ws(req, socket, head, { target: gatewayTarget() });
 });
 
 process.on("SIGTERM", () => {
