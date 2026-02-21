@@ -73,7 +73,7 @@ process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 // Where the gateway will listen internally (we proxy to it).
 const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT ?? "18789", 10);
 const INTERNAL_GATEWAY_HOST_RAW = process.env.INTERNAL_GATEWAY_HOST?.trim() || "localhost";
-const GATEWAY_START_TIMEOUT_MS = Number.parseInt(process.env.GATEWAY_START_TIMEOUT_MS ?? "45000", 10);
+const GATEWAY_START_TIMEOUT_MS = Number.parseInt(process.env.GATEWAY_START_TIMEOUT_MS ?? "120000", 10);
 
 function resolveGatewayHostCandidates(host) {
   const explicit = String(host || "")
@@ -161,6 +161,7 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
+let gatewayStartedAt = null;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -214,12 +215,14 @@ async function startGateway() {
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
     },
   });
+  gatewayStartedAt = Date.now();
 
   gatewayProc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
     gatewayProc = null;
+    gatewayStartedAt = null;
   });
 
   gatewayProc.on("exit", (code, signal) => {
@@ -227,6 +230,7 @@ async function startGateway() {
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    gatewayStartedAt = null;
   });
 }
 
@@ -256,12 +260,20 @@ async function ensureGatewayRunning() {
     const probe = await probeGateway();
     if (probe.ok) return { ok: true };
 
+    const ageMs = gatewayStartedAt ? Date.now() - gatewayStartedAt : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(ageMs) && ageMs < GATEWAY_START_TIMEOUT_MS) {
+      const remainingMs = Math.max(1_000, GATEWAY_START_TIMEOUT_MS - ageMs);
+      const warmed = await waitForGatewayReady({ timeoutMs: remainingMs });
+      if (warmed) return { ok: true };
+    }
+
     const staleMsg = `[gateway] process is running but ${INTERNAL_GATEWAY_PORT} is unreachable on ${INTERNAL_GATEWAY_HOST_CANDIDATES.join(", ")}`;
     lastGatewayError = staleMsg;
     console.warn(staleMsg);
     try { gatewayProc.kill("SIGTERM"); } catch {}
     await sleep(750);
     gatewayProc = null;
+    gatewayStartedAt = null;
   }
 
   if (!gatewayStarting) {
@@ -276,11 +288,6 @@ async function ensureGatewayRunning() {
       } catch (err) {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
-        try {
-          if (gatewayProc) gatewayProc.kill("SIGTERM");
-        } catch {}
-        await sleep(750);
-        gatewayProc = null;
         // Collect extra diagnostics to help users file issues.
         await runDoctorBestEffort();
         throw err;
