@@ -112,7 +112,42 @@ ENV NPM_CONFIG_FETCH_RETRIES=5 \
 RUN apt-get -o Acquire::Retries=5 update \
   && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     ca-certificates \
+    build-essential \
+    curl \
+    file \
+    git \
+    procps \
   && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1001 -s /bin/bash linuxbrew
+
+RUN set -eux; \
+  for attempt in 1 2 3; do \
+    if su -c \
+      'NONINTERACTIVE=1 HOMEBREW_NO_ANALYTICS=1 \
+       /bin/bash -c "$(curl -fsSL \
+         --retry 5 --retry-all-errors --retry-delay 2 \
+         -H \"Cache-Control: no-cache\" -H \"Pragma: no-cache\" \
+         https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+      linuxbrew; then \
+      break; \
+    fi; \
+    if [ "${attempt}" -eq 3 ]; then \
+      echo "Homebrew install failed after retries" >&2; \
+      exit 1; \
+    fi; \
+    sleep $((attempt * 10)); \
+  done
+
+RUN chmod -R o+rwX /home/linuxbrew/.linuxbrew
+
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+ENV HOMEBREW_NO_AUTO_UPDATE=1
+ENV HOMEBREW_NO_ANALYTICS=1
+ENV HOMEBREW_NO_ENV_HINTS=1
+ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
+ENV HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar
+ENV HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew
 
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
