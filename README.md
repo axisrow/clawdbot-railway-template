@@ -34,6 +34,8 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
+- `OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB` — heap cap passed to `openclaw gateway run` (auto-tuned from container memory unless overridden)
+- `OPENCLAW_CLI_MAX_OLD_SPACE_MB` — heap cap passed to setup/debug CLI commands (auto-tuned from container memory unless overridden)
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
@@ -101,6 +103,15 @@ Checklist:
   - `OPENCLAW_WORKSPACE_DIR=/data/workspace`
 - Ensure **Public Networking** is enabled and `PORT=8080`.
 - Check Railway logs for the wrapper error: it will show `Gateway not ready:` with the reason.
+- Check `/healthz` or `/setup/api/debug`: both now include the effective child-process memory settings and the last gateway exit details.
+
+### Gateway boot OOM (`openclaw-gateway` heap out of memory)
+
+If logs show `FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory` while the wrapper is waiting for the gateway to become ready:
+
+- Increase `OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB` for runtime boot crashes.
+- Increase `OPENCLAW_CLI_MAX_OLD_SPACE_MB` if setup/debug commands OOM.
+- The wrapper now auto-tunes child-process heap limits from container memory, logs the exact `NODE_OPTIONS` it passes to OpenClaw child processes, and exposes the full memory config via `/setup/api/debug`.
 
 ### Build OOM (out of memory) on Railway
 
@@ -108,6 +119,7 @@ Building OpenClaw from source can exceed small memory tiers.
 
 Recommendations:
 - Use a plan with **2GB+ memory**.
+- If needed, increase Docker build arg `OPENCLAW_BUILD_MAX_OLD_SPACE_MB` before redeploying.
 - If you see `Reached heap limit Allocation failed - JavaScript heap out of memory`, upgrade memory and redeploy.
 
 ## Local smoke test

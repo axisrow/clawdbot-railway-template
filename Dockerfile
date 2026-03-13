@@ -44,6 +44,7 @@ WORKDIR /openclaw
 # Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
 # Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
 ARG OPENCLAW_GIT_REF=v2026.3.12
+ARG OPENCLAW_BUILD_MAX_OLD_SPACE_MB=1536
 RUN set -eux; \
   cloned=0; \
   for attempt in 1 2 3; do \
@@ -86,7 +87,7 @@ RUN set -eux; \
 
 RUN set -eux; \
   for attempt in 1 2 3; do \
-    if pnpm install --no-frozen-lockfile --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000; then \
+    if NODE_OPTIONS="--max-old-space-size=${OPENCLAW_BUILD_MAX_OLD_SPACE_MB}" pnpm install --no-frozen-lockfile --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000; then \
       break; \
     fi; \
     if [ "${attempt}" -eq 3 ]; then \
@@ -95,9 +96,10 @@ RUN set -eux; \
     fi; \
     sleep $((attempt * 8)); \
   done
-RUN pnpm build
+RUN NODE_OPTIONS="--max-old-space-size=${OPENCLAW_BUILD_MAX_OLD_SPACE_MB}" pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
+RUN NODE_OPTIONS="--max-old-space-size=${OPENCLAW_BUILD_MAX_OLD_SPACE_MB}" pnpm ui:install \
+  && NODE_OPTIONS="--max-old-space-size=${OPENCLAW_BUILD_MAX_OLD_SPACE_MB}" pnpm ui:build
 
 
 # Runtime image

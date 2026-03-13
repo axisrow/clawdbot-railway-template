@@ -108,6 +108,126 @@ function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
 }
 
+function parsePositiveMbEnv(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return null;
+
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a positive integer number of megabytes`);
+  }
+  const value = Number.parseInt(raw, 10);
+  if (value <= 0) {
+    throw new Error(`${name} must be a positive integer number of megabytes`);
+  }
+  return value;
+}
+
+function mergeNodeOptions(base, extra) {
+  return [base, extra].filter(Boolean).join(" ").trim();
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function availableMemoryMb() {
+  const constrainedBytes =
+    typeof process.constrainedMemory === "function" ? process.constrainedMemory() : 0;
+  const totalBytes = constrainedBytes > 0 ? constrainedBytes : os.totalmem();
+  return Math.max(256, Math.floor(totalBytes / (1024 * 1024)));
+}
+
+function defaultGatewayMaxOldSpaceMb() {
+  const totalMemoryMb = availableMemoryMb();
+  return clamp(Math.floor(totalMemoryMb * 0.7), 256, 1536);
+}
+
+function defaultCliMaxOldSpaceMb() {
+  const totalMemoryMb = availableMemoryMb();
+  return clamp(Math.floor(totalMemoryMb * 0.25), 256, 768);
+}
+
+const OPENCLAW_CHILD_MAX_OLD_SPACE_MB = parsePositiveMbEnv("OPENCLAW_CHILD_MAX_OLD_SPACE_MB");
+const OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB =
+  parsePositiveMbEnv("OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB") ??
+  OPENCLAW_CHILD_MAX_OLD_SPACE_MB ??
+  defaultGatewayMaxOldSpaceMb();
+const OPENCLAW_CLI_MAX_OLD_SPACE_MB =
+  parsePositiveMbEnv("OPENCLAW_CLI_MAX_OLD_SPACE_MB") ??
+  OPENCLAW_CHILD_MAX_OLD_SPACE_MB ??
+  defaultCliMaxOldSpaceMb();
+
+function buildOpenClawChildEnv(opts = {}) {
+  const maxOldSpaceMb =
+    opts.maxOldSpaceMb ??
+    OPENCLAW_CLI_MAX_OLD_SPACE_MB;
+  const nodeOptions = mergeNodeOptions(
+    process.env.NODE_OPTIONS?.trim() || "",
+    maxOldSpaceMb ? `--max-old-space-size=${maxOldSpaceMb}` : "",
+  );
+
+  const env = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: STATE_DIR,
+    OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+  };
+
+  if (nodeOptions) env.NODE_OPTIONS = nodeOptions;
+  else delete env.NODE_OPTIONS;
+
+  return { env, nodeOptions: nodeOptions || null, maxOldSpaceMb };
+}
+
+function openClawMemoryConfig() {
+  const constrainedBytes =
+    typeof process.constrainedMemory === "function" ? process.constrainedMemory() : 0;
+  return {
+    availableMemoryMb: availableMemoryMb(),
+    memorySource: constrainedBytes > 0 ? "process.constrainedMemory" : "os.totalmem",
+    inheritedNodeOptions: process.env.NODE_OPTIONS?.trim() || null,
+    childMaxOldSpaceMb: OPENCLAW_CHILD_MAX_OLD_SPACE_MB,
+    gatewayMaxOldSpaceMb: OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB,
+    cliMaxOldSpaceMb: OPENCLAW_CLI_MAX_OLD_SPACE_MB,
+    gatewayNodeOptions: buildOpenClawChildEnv({ maxOldSpaceMb: OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB }).nodeOptions,
+    cliNodeOptions: buildOpenClawChildEnv({ maxOldSpaceMb: OPENCLAW_CLI_MAX_OLD_SPACE_MB }).nodeOptions,
+  };
+}
+
+function publicOpenClawMemoryConfig() {
+  return {
+    availableMemoryMb: availableMemoryMb(),
+    childMaxOldSpaceMb: OPENCLAW_CHILD_MAX_OLD_SPACE_MB,
+    gatewayMaxOldSpaceMb: OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB,
+    cliMaxOldSpaceMb: OPENCLAW_CLI_MAX_OLD_SPACE_MB,
+  };
+}
+
+function publicGatewayLaunchInfo() {
+  if (!lastGatewayLaunch) return null;
+  return {
+    at: lastGatewayLaunch.at,
+    maxOldSpaceMb: lastGatewayLaunch.maxOldSpaceMb,
+  };
+}
+
+function publicGatewayExitInfo() {
+  if (!lastGatewayExit) return null;
+  return {
+    code: lastGatewayExit.code,
+    signal: lastGatewayExit.signal,
+    at: lastGatewayExit.at,
+    maxOldSpaceMb: lastGatewayExit.maxOldSpaceMb,
+  };
+}
+
+function publicGatewayError() {
+  if (!lastGatewayError) return null;
+  if (lastGatewayExit) {
+    return `[gateway] exited code=${lastGatewayExit.code} signal=${lastGatewayExit.signal}`;
+  }
+  return "[gateway] startup failed";
+}
+
 function resolveConfigCandidates() {
   const explicit = process.env.OPENCLAW_CONFIG_PATH?.trim();
   if (explicit) return [explicit];
@@ -162,6 +282,7 @@ function isConfigured() {
 let gatewayProc = null;
 let gatewayStarting = null;
 let gatewayStartedAt = null;
+let lastGatewayLaunch = null;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -207,18 +328,24 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
+  const gatewayChild = buildOpenClawChildEnv({ maxOldSpaceMb: OPENCLAW_GATEWAY_MAX_OLD_SPACE_MB });
+  console.log(
+    `[gateway] spawning with NODE_OPTIONS=${gatewayChild.nodeOptions || "(none)"} max_old_space_mb=${gatewayChild.maxOldSpaceMb}`,
+  );
+  lastGatewayLaunch = {
+    at: new Date().toISOString(),
+    nodeOptions: gatewayChild.nodeOptions,
+    maxOldSpaceMb: gatewayChild.maxOldSpaceMb,
+  };
+
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
-    env: {
-      ...process.env,
-      OPENCLAW_STATE_DIR: STATE_DIR,
-      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-    },
+    env: gatewayChild.env,
   });
   gatewayStartedAt = Date.now();
 
   gatewayProc.on("error", (err) => {
-    const msg = `[gateway] spawn error: ${String(err)}`;
+    const msg = `[gateway] spawn error: ${String(err)} (NODE_OPTIONS=${lastGatewayLaunch?.nodeOptions || "(none)"})`;
     console.error(msg);
     lastGatewayError = msg;
     gatewayProc = null;
@@ -226,9 +353,16 @@ async function startGateway() {
   });
 
   gatewayProc.on("exit", (code, signal) => {
-    const msg = `[gateway] exited code=${code} signal=${signal}`;
+    const msg = `[gateway] exited code=${code} signal=${signal} nodeOptions=${lastGatewayLaunch?.nodeOptions || "(none)"}`;
     console.error(msg);
-    lastGatewayExit = { code, signal, at: new Date().toISOString() };
+    lastGatewayError = msg;
+    lastGatewayExit = {
+      code,
+      signal,
+      at: new Date().toISOString(),
+      nodeOptions: lastGatewayLaunch?.nodeOptions || null,
+      maxOldSpaceMb: lastGatewayLaunch?.maxOldSpaceMb || null,
+    };
     gatewayProc = null;
     gatewayStartedAt = null;
   });
@@ -401,14 +535,16 @@ app.get("/healthz", async (_req, res) => {
       configured: isConfigured(),
       stateDir: STATE_DIR,
       workspaceDir: WORKSPACE_DIR,
+      memory: publicOpenClawMemoryConfig(),
     },
     gateway: {
       target: gatewayTargetResolved,
       hostCandidates: INTERNAL_GATEWAY_HOST_CANDIDATES,
       activeHost: activeGatewayHost,
       reachable: gatewayReachable,
-      lastError: lastGatewayError,
-      lastExit: lastGatewayExit,
+      lastLaunch: publicGatewayLaunchInfo(),
+      lastError: publicGatewayError(),
+      lastExit: publicGatewayExitInfo(),
       lastDoctorAt,
     },
   });
@@ -724,15 +860,17 @@ function buildOnboardArgs(payload) {
 
 function runCmd(cmd, args, opts = {}) {
   return new Promise((resolve) => {
-    const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 120_000;
+    const {
+      timeoutMs: requestedTimeoutMs,
+      maxOldSpaceMb,
+      ...spawnOpts
+    } = opts;
+    const timeoutMs = Number.isFinite(requestedTimeoutMs) ? requestedTimeoutMs : 120_000;
+    const child = buildOpenClawChildEnv({ maxOldSpaceMb: maxOldSpaceMb ?? OPENCLAW_CLI_MAX_OLD_SPACE_MB });
 
     const proc = childProcess.spawn(cmd, args, {
-      ...opts,
-      env: {
-        ...process.env,
-        OPENCLAW_STATE_DIR: STATE_DIR,
-        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-      },
+      ...spawnOpts,
+      env: child.env,
     });
 
     let out = "";
@@ -758,20 +896,20 @@ function runCmd(cmd, args, opts = {}) {
         try { proc.kill("SIGKILL"); } catch {}
       }, 2_000);
       out += `\n[timeout] Command exceeded ${timeoutMs}ms and was terminated.\n`;
-      resolve({ code: 124, output: out });
+      resolve({ code: 124, output: out, nodeOptions: child.nodeOptions });
     }, timeoutMs);
 
     proc.on("error", (err) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       out += `\n[spawn error] ${String(err)}\n`;
-      resolve({ code: 127, output: out });
+      resolve({ code: 127, output: out, nodeOptions: child.nodeOptions });
     });
 
     proc.on("close", (code) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      resolve({ code: code ?? 0, output: out });
+      resolve({ code: code ?? 0, output: out, nodeOptions: child.nodeOptions });
     });
   });
 }
@@ -967,16 +1105,14 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", "slack"]));
     }
 
-    step("[5/5] Restarting gateway...");
-    // Apply changes immediately.
-    await restartGateway();
-
     // Ensure OpenClaw applies any "configured but not enabled" channel/plugin changes.
     // This makes Telegram/Discord pairing issues much less "silent".
+    step("[5/5] Finalizing gateway configuration...");
     const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
     extra += `\n[doctor --fix] exit=${fix.code} (output ${fix.output.length} chars)\n${fix.output || "(no output)"}`;
 
-    // Doctor may require a restart depending on changes.
+    // Apply configuration once after doctor completes so the gateway does not overlap
+    // with another potentially heavy OpenClaw CLI process on small instances.
     await restartGateway();
   }
 
@@ -1028,6 +1164,8 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       gatewayRunning: Boolean(gatewayProc),
       gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
+      memory: openClawMemoryConfig(),
+      lastGatewayLaunch,
       lastGatewayError,
       lastGatewayExit,
       lastDoctorAt,
@@ -1456,7 +1594,7 @@ app.use(async (req, res) => {
       const hint = [
         "Gateway not ready.",
         String(err),
-        lastGatewayError ? `\n${lastGatewayError}` : "",
+        publicGatewayError() ? `\n${publicGatewayError()}` : "",
         "\nTroubleshooting:",
         "- Visit /setup and check the Debug Console",
         "- Visit /setup/api/debug for config + gateway diagnostics",
@@ -1484,6 +1622,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway host candidates: ${INTERNAL_GATEWAY_HOST_CANDIDATES.join(", ")}`);
   console.log(`[wrapper] gateway target: ${gatewayTarget()}`);
+  console.log(`[wrapper] child memory config: ${JSON.stringify(openClawMemoryConfig())}`);
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
