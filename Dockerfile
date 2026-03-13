@@ -43,7 +43,7 @@ WORKDIR /openclaw
 
 # Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
 # Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
-ARG OPENCLAW_GIT_REF=v2026.2.26
+ARG OPENCLAW_GIT_REF=v2026.3.12
 RUN set -eux; \
   cloned=0; \
   for attempt in 1 2 3; do \
